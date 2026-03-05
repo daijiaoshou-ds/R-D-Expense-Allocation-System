@@ -75,3 +75,5 @@ Thumbs.db
 *.xls
 *.csv
 审计底稿*.xlsx
+*start-local.bat
+

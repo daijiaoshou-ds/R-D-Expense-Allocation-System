@@ -1,11 +1,11 @@
 import streamlit as st
 import pandas as pd
 import io
-import traceback  # 移到顶部
+import traceback
 import logic
 
 # CSS: 调大间距，优化字体
-st.set_page_config(page_title="审计分摊工具 V0.5", layout="wide", page_icon="🏦")
+st.set_page_config(page_title="审计分摊工具 V0.6", layout="wide", page_icon="🏦")
 st.markdown("""
 <style>
     .main .block-container {padding-top: 2rem; overflow-y: auto !important;} 
@@ -54,27 +54,33 @@ def init_session_state():
             'mappings': None,
             'labor_subjects': [],
             'clean_data': None,
-            'config_error': None  # 用于显示配置错误
+            'config_error': None
         }
 
 def load_data_to_state(file_obj, key):
     if file_obj:
         try:
-            # 检查是否是新文件（通过文件名判断）
             current_file_name = getattr(file_obj, 'name', 'unknown')
             last_file_key = f"{key}_last_file"
             
-            # 如果是同一个文件，直接跳过（不重置配置）
             if last_file_key in st.session_state and st.session_state[last_file_key] == current_file_name:
                 return True
             
-            # 新文件，读取数据
+            # 修改：限制从2万改为10万
+            MAX_ROWS = 100000
+            
+            # 先读取文件
             df = pd.read_excel(file_obj)
+            
+            if len(df) > MAX_ROWS:
+                st.error(f"❌ {current_file_name} 行数超过限制（{len(df):,} > {MAX_ROWS:,}），请分批处理或联系管理员")
+                return False
+            
             if '是否有效' not in df.columns: 
                 df.insert(0, '是否有效', True)
             
             st.session_state['data_storage'][key] = df
-            st.session_state[last_file_key] = current_file_name  # 记录文件名
+            st.session_state[last_file_key] = current_file_name
             
             # 只有新上传文件时才重置配置状态
             st.session_state['config_status'] = {
@@ -86,6 +92,7 @@ def load_data_to_state(file_obj, key):
                 'config_error': None
             }
             st.session_state['calc_result'] = None
+            # st.success(f"✅ 已加载 {current_file_name}：{len(df):,} 行 × {len(df.columns)} 列")
             return True
             
         except Exception as e:
@@ -135,25 +142,108 @@ def column_mapper_ui(user_cols, required_fields, optional_fields, key_prefix):
 # Main
 # ==========================================
 init_session_state()
-st.title("🏦 研发费用分摊系统 V0.5 (测试版)")
+st.title("🏦 研发费用分摊系统 V0.6 (优化版)")
 
 # Sidebar 数据上传
+# 在 sidebar 中替换上传部分
 with st.sidebar:
     st.header("1. 资料上传")
-    f_time = st.file_uploader("工时表", type=['xlsx'], key="fu_time")
-    f_expense = st.file_uploader("序时账", type=['xlsx'], key="fu_exp")
-    f_wage = st.file_uploader("工资表 (可选)", type=['xlsx'], key="fu_wage")
+    
+    uploaded_files = st.file_uploader(
+        "拖拽或点击上传Excel文件（支持多选）", 
+        type=['xlsx', 'xls'], 
+        accept_multiple_files=True,
+        key="auto_upload"
+    )
+    
+    # 自动识别并加载
+    if uploaded_files:
+        load_summary = {"工时表": 0, "工资表": 0, "序时账": 0, "跳过": 0}
+        
+        for file in uploaded_files:
+            file_name = file.name
+            file_lower = file_name.lower()
+            
+            # 识别逻辑
+            if any(k in file_lower for k in ['工时', 'time', 'hour']):
+                key, type_name = 'time', "工时表"
+            elif any(k in file_lower for k in ['工资', 'wage', 'salary', '薪酬']):
+                key, type_name = 'wage', "工资表"
+            elif any(k in file_lower for k in ['序时账', '明细账', 'expense', 'ledger', '研发', '凭证']):
+                key, type_name = 'exp', "序时账"
+            else:
+                # 列名识别兜底
+                try:
+                    df_preview = pd.read_excel(file, nrows=3)
+                    cols = ' '.join(df_preview.columns).lower()
+                    
+                    if '工时' in cols and '项目' in cols:
+                        key, type_name = 'time', "工时表"
+                    elif ('工资' in cols or '社保' in cols) and '姓名' in cols:
+                        key, type_name = 'wage', "工资表"
+                    elif '科目' in cols or '借方' in cols or '摘要' in cols:
+                        key, type_name = 'exp', "序时账"
+                    else:
+                        load_summary["跳过"] += 1
+                        continue
+                except:
+                    load_summary["跳过"] += 1
+                    continue
+            
+            if key and load_data_to_state(file, key):
+                load_summary[type_name] += 1
+        
+        # 极简摘要：一行文字
+        if any(v > 0 for k, v in load_summary.items() if k != "跳过"):
+            parts = [f"{k}:{v}" for k, v in load_summary.items() if v > 0]
+            st.caption(f"✅ 已加载: {' | '.join(parts)}")
+        
+        if load_summary["跳过"] > 0:
+            st.caption(f"⚠️ 跳过 {load_summary['跳过']} 个无法识别的文件")
+    
+    else:
+        st.info("👆 请上传Excel文件（支持多选）")
+    
+    # 始终显示当前已加载的文件列表（简洁版）
+    has_data = any(v is not None for v in st.session_state['data_storage'].values())
+    if has_data:
+        st.divider()
+        st.caption("📁 当前文件：")
+        for key, name in [('time', '工时'), ('wage', '工资'), ('exp', '序时账')]:
+            df = st.session_state['data_storage'][key]
+            if df is not None:
+                file_name = st.session_state.get(f"{key}_last_file", "...")
+                # 只显示文件名前15个字符
+                display_name = file_name[:12] + "..." if len(file_name) > 15 else file_name
+                st.text(f"• {name}: {display_name} ({len(df)}行)")
     
     st.divider()
-    enable_variance = st.toggle("⚖️ 启用轧差模式", value=True)
+    st.header("2. 孤儿费用处理")
     
-    if f_time: load_data_to_state(f_time, 'time')
-    if f_expense: load_data_to_state(f_expense, 'exp')
-    if f_wage: load_data_to_state(f_wage, 'wage')
+    # 简化的孤儿费用控制
+    use_funnel = st.toggle("🔄 漏斗轧差（优先归属至最近月份）", value=True)
+    use_global = st.toggle("⚡ 暴力轧差（直接全局分摊）", value=False)
     
-    # 显示配置状态
+    # 逻辑判断
+    if use_funnel and not use_global:
+        orphan_mode = "funnel"
+        enable_variance = True
+        st.caption("✅ 当前：优先寻找近亲月份归属，无近亲则全局分摊")
+    elif use_global and not use_funnel:
+        orphan_mode = "global"
+        enable_variance = True
+        st.caption("✅ 当前：直接按全局工时比例分摊")
+    elif use_funnel and use_global:
+        orphan_mode = "funnel"  # 优先漏斗
+        enable_variance = True
+        st.warning("⚠️ 同时开启两种模式，优先使用漏斗模式")
+    else:
+        orphan_mode = "none"
+        enable_variance = False
+        st.caption("🚫 当前：不处理孤儿费用（无工时人员的费用将悬空）")
+    
     st.divider()
-    st.header("2. 系统状态")
+    st.header("3. 系统状态")
     status = st.session_state['config_status']
     if status['base_mapped']:
         st.success("✅ 阶段一完成")
@@ -176,14 +266,10 @@ else:
     tab1, tab2, tab3 = st.tabs(["⚙️ 字段映射配置", "🧹 数据预览与清洗", "🚀 生成审计底稿"])
     
     with tab1:
-        # 显示之前的错误（如果有）
         if cfg.get('config_error'):
             st.error(f"上次配置错误: {cfg['config_error']}")
-            cfg['config_error'] = None  # 清空错误
+            cfg['config_error'] = None
         
-        # ==========================================
-        # 阶段一：基础字段映射 (Form)
-        # ==========================================
         if not cfg['base_mapped']:
             st.info("💡 **阶段一：基础字段映射**\n\n请完成必填字段映射，点击底部「确认基础配置」")
             
@@ -212,7 +298,6 @@ else:
                 submitted = st.form_submit_button("✅ 确认基础配置并加载", type="primary", use_container_width=True)
                 
                 if submitted:
-                    # 验证必填项
                     missing = []
                     for k, v in map_t.items():
                         if not v: missing.append(f"工时表-{k}")
@@ -221,7 +306,6 @@ else:
                     
                     if missing:
                         cfg['config_error'] = f"以下必填项未完成映射: {', '.join(missing)}"
-                        # 不设置 base_mapped，保持当前页面显示错误
                     else:
                         try:
                             with st.spinner("正在清洗数据..."):
@@ -233,7 +317,6 @@ else:
                                 clean_e = logic.clean_data(d_e, map_e)
                                 clean_w = logic.clean_data(d_w, map_w) if d_w is not None else None
                                 
-                                # 保存基础配置状态（关键：不要在这里调 st.rerun()）
                                 cfg['base_mapped'] = True
                                 cfg['mappings'] = {
                                     'time': map_t, 
@@ -245,26 +328,21 @@ else:
                                     'time': clean_t, 
                                     'exp': clean_e, 
                                     'wage': clean_w,
-                                    'enable_variance': enable_variance
+                                    'enable_variance': enable_variance,
+                                    'orphan_mode': orphan_mode
                                 }
                                 cfg['adv_configured'] = False
                                 cfg['labor_subjects'] = []
                                 cfg['config_error'] = None
                                 
-                                # Form 提交后会自动刷新页面，此时 base_mapped=True，会显示阶段二
                                 st.success("✅ 基础配置已保存！")
                                 st.balloons()
                                 
                         except Exception as e:
                             cfg['config_error'] = f"数据清洗失败: {str(e)}"
-                            # 保存 traceback 到 session_state 以便显示
                             cfg['error_detail'] = traceback.format_exc()
         
-        # ==========================================
-        # 阶段二：高级配置（剔除科目）
-        # ==========================================
         else:
-            # 显示阶段一完成摘要
             st.markdown('<div class="success-banner"><b>✅ 阶段一完成：</b>基础字段映射已保存</div>', unsafe_allow_html=True)
             
             with st.container(border=True):
@@ -278,29 +356,26 @@ else:
                 if m.get('has_wage') and m['wage']:
                     st.markdown(f"**工资表：** {', '.join([f'`{k}→{v}`' for k,v in m['wage'].items() if v])}")
             
-            # 重置按钮
             if st.button("🔄 重新配置阶段一", type="secondary"):
                 cfg['base_mapped'] = False
                 cfg['adv_configured'] = False
-                st.rerun()  # 这里需要 rerun 来切换回阶段一界面
+                st.rerun()
             
             st.divider()
             
             if not cfg['adv_configured']:
                 st.info("💡 **阶段二：序时账人工剔除**\n\n基于已配置的「科目名称」列，选择需要从序时账中剔除的科目")
                 
-                # 从配置中获取科目名称列，读取可选科目
                 subj_col = cfg['mappings']['exp']['科目名称']
                 exp_df = st.session_state['data_storage']['exp']
                 available_subjects = sorted(exp_df[subj_col].unique().tolist())
                 
                 st.caption(f"从列 `{subj_col}` 中检测到 {len(available_subjects)} 个不同科目")
                 
-                # 使用 multiselect 选择剔除科目（不在 form 中，实时更新）
                 selected_subjects = st.multiselect(
                     "选择需剔除的科目（工资表已包含的费用，避免重复计算）:",
                     available_subjects,
-                    default=cfg.get('labor_subjects', []),  # 保留已选择的
+                    default=cfg.get('labor_subjects', []),
                     help="这些科目的金额将从序时账中剔除"
                 )
                 
@@ -310,7 +385,7 @@ else:
                         cfg['labor_subjects'] = selected_subjects
                         cfg['adv_configured'] = True
                         st.success(f"已保存剔除设置（{len(selected_subjects)} 个科目）")
-                        st.rerun()  # 刷新进入完成状态
+                        st.rerun()
                         
                 with col2:
                     if selected_subjects:
@@ -337,7 +412,6 @@ else:
             
             clean_data = cfg['clean_data']
             
-            # 根据选择确定要编辑的数据
             if sel == "工时表": 
                 source_key = 'time'
                 df_to_edit = clean_data['time'].copy()
@@ -350,17 +424,15 @@ else:
             else:
                 st.stop()
             
-            # 显示可交互编辑器
             st.caption(f"💡 提示：可直接双击单元格修改，使用列头筛选/排序，完成后点击底部「保存修改」")
             
-            # 关键：使用 data_editor 替代 dataframe
             edited_df = st.data_editor(
                 df_to_edit,
                 use_container_width=True,
-                height=600,  # 拉高点，方便编辑
+                height=600,
                 hide_index=True,
-                key=f"editor_{source_key}",  # 给key才能追踪修改
-                num_rows="dynamic",  # 允许增删行（可选）
+                key=f"editor_{source_key}",
+                num_rows="dynamic",
                 column_config={
                     "是否有效": st.column_config.CheckboxColumn(
                         "是否有效",
@@ -370,13 +442,11 @@ else:
                 } if "是否有效" in df_to_edit.columns else None
             )
             
-            # 检测是否有修改
             has_changes = not edited_df.equals(df_to_edit)
             
             col1, col2 = st.columns([1, 3])
             with col1:
                 if st.button("💾 保存修改", type="primary", disabled=not has_changes):
-                    # 保存回 clean_data
                     cfg['clean_data'][source_key] = edited_df
                     st.success(f"✅ {sel} 修改已保存！将用于后续计算和导出")
                     st.balloons()
@@ -404,7 +474,8 @@ else:
                             d['time'], 
                             d['exp'], 
                             cfg['labor_subjects'],
-                            d['enable_variance']
+                            d['enable_variance'],
+                            d['orphan_mode']
                         )
                         st.session_state['calc_result'] = res
                     except Exception as e:
@@ -438,6 +509,7 @@ else:
                         d = cfg['clean_data']
                         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
                             res['pivot'].to_excel(writer, sheet_name='1_最终分摊表')
+                            
                             if not res['agg'].empty:
                                 res['agg'].to_excel(writer, sheet_name='2_人工费聚合表', index=False)
                             else:
@@ -447,12 +519,14 @@ else:
                                 res['detail'].to_excel(writer, sheet_name='3_人工费明细流水', index=False)
                             else:
                                 pd.DataFrame({'提示': ['无工资表数据']}).to_excel(writer, sheet_name='3_人工费明细流水', index=False)
-                                
-                            if not res['orphan'].empty:
-                                res['orphan'].to_excel(writer, sheet_name='4_轧差孤儿费用', index=False)
-                            else:
-                                pd.DataFrame({'提示': ['无孤儿费用']}).to_excel(writer, sheet_name='4_轧差孤儿费用', index=False)
                             
+                            # 修改：完善孤儿费用明细表
+                            if not res['orphan'].empty:
+                                res['orphan'].to_excel(writer, sheet_name='4_孤儿费用明细', index=False)
+                            else:
+                                pd.DataFrame({'提示': ['无孤儿费用']}).to_excel(writer, sheet_name='4_孤儿费用明细', index=False)
+                            
+                            # 保留原始数据
                             if d['wage'] is not None: 
                                 d['wage'].to_excel(writer, sheet_name='源_工资表', index=False)
                             d['time'].to_excel(writer, sheet_name='源_工时表', index=False)
