@@ -120,7 +120,7 @@ def run_allocation_v8(df_wage, df_time, df_expense, labor_subjects=[], enable_va
         logs.append(f"👥 正常分摊记录: {len(normals)} 条，孤儿记录: {len(orphans)} 条")
 
         # ==========================================
-        # 孤儿费用处理（根据模式选择）
+        # 孤儿费用处理（三层漏斗：近亲 → 局部 → 全局）
         # ==========================================
         if orphan_mode == "none":
             logs.append("🚫 孤儿费用处理已禁用")
@@ -138,21 +138,65 @@ def run_allocation_v8(df_wage, df_time, df_expense, labor_subjects=[], enable_va
                             }]))
                             
         elif orphan_mode == "global":
-            # 暴力模式：所有孤儿直接进入全局轧差
+            # 暴力模式：优先局部轧差，其次全局轧差
             for idx, orphan_row in orphans.iterrows():
+                person_name = orphan_row['姓名']
+                person_id = orphan_row['工号']
+                orphan_month_num = pd.to_numeric(orphan_row['月份'], errors='coerce')
+                orphan_month_str = str(int(orphan_month_num))
+                
                 for track in track_cols:
                     if track not in orphan_row or orphan_row[track] == 0:
                         continue
-                    global_orphan_records.append({
-                        '姓名': orphan_row['姓名'], 
-                        '工号': orphan_row['工号'], 
-                        '月份': str(orphan_row['月份']), 
-                        '赛道': track, 
-                        '金额': orphan_row[track]
-                    })
-            logs.append(f"⚡ 暴力轧差模式：{len(orphans)} 条孤儿记录将进入全局分摊")
+                    
+                    orphan_amount = orphan_row[track]
+                    
+                    # 先尝试局部轧差（当月工时）
+                    month_time_agg = time_agg[time_agg['月份'] == orphan_month_str]
+                    
+                    if not month_time_agg.empty:
+                        total_month_hours = month_time_agg['工时'].sum()
+                        if total_month_hours > 0:
+                            rate = orphan_amount / total_month_hours
+                            
+                            # 透视表数据
+                            variance_alloc = month_time_agg[['月份', '项目号', '工时']].copy()
+                            variance_alloc['金额'] = variance_alloc['工时'] * rate
+                            variance_alloc['科目名称'] = f"{track}-轧差"
+                            final_stream.append(variance_alloc[['月份', '项目号', '科目名称', '金额']])
+                            
+                            # 明细数据（关键：包含人员信息）
+                            variance_detail = month_time_agg[['姓名', '工号', '月份', '项目号', '工时']].copy()
+                            for t in track_cols:
+                                variance_detail[f'{t}-轧差'] = 0.0
+                            variance_detail[f'{track}-轧差'] = variance_detail['工时'] * rate
+                            variance_detail_rows.append(variance_detail)
+                            
+                            # 记录孤儿明细（局部轧差）- 新增
+                            orphan_rows.append(pd.DataFrame([{
+                                '姓名': person_name,
+                                '工号': person_id,
+                                '月份': orphan_month_str,
+                                '赛道': track,
+                                '金额': orphan_amount,
+                                '处理方式': f'局部轧差({orphan_month_str}月)'
+                            }]))
+                            
+                            logs.append(f"🏠 [{track}] {person_name} 的 {int(orphan_month_num)}月费用 {orphan_amount:,.2f} → 局部轧差（当月{len(month_time_agg)}人/{total_month_hours}小时）")
+                    else:
+                        # 当月无工时，转入全局轧差
+                        global_orphan_records.append({
+                            '姓名': person_name, 
+                            '工号': person_id, 
+                            '月份': orphan_month_str, 
+                            '赛道': track, 
+                            '金额': orphan_amount
+                        })
+                        logs.append(f"⚡ [{track}] {person_name} 的 {int(orphan_month_num)}月费用 {orphan_amount:,.2f} → 待全局轧差（当月无工时）")
             
-        else:  # funnel模式
+            logs.append(f"⚡ 暴力轧差处理完成：局部优先，当月无工时则全局")
+            
+        else:  # funnel模式：近亲 → 局部 → 全局
             if not orphans.empty:
                 person_time_history = time_agg.groupby(['姓名', '工号', '月份'])['工时'].sum().reset_index()
                 person_time_history['month_num'] = pd.to_numeric(person_time_history['月份'], errors='coerce')
@@ -161,6 +205,7 @@ def run_allocation_v8(df_wage, df_time, df_expense, labor_subjects=[], enable_va
                     person_name = orphan_row['姓名']
                     person_id = orphan_row['工号']
                     orphan_month_num = pd.to_numeric(orphan_row['月份'], errors='coerce')
+                    orphan_month_str = str(int(orphan_month_num))
                     
                     # 找历史工时（小于孤儿月份）
                     person_history = person_time_history[
@@ -176,6 +221,7 @@ def run_allocation_v8(df_wage, df_time, df_expense, labor_subjects=[], enable_va
                         orphan_amount = orphan_row[track]
                         has_relative = False
                         
+                        # 第一层：找近亲（前月份）
                         if not person_history.empty:
                             nearest_month = str(int(person_history.iloc[0]['月份']))
                             
@@ -188,46 +234,78 @@ def run_allocation_v8(df_wage, df_time, df_expense, labor_subjects=[], enable_va
                             if not target_hours.empty:
                                 total_hours = target_hours['工时'].sum()
                                 if total_hours > 0:
-                                    # 生成分摊明细
                                     target_hours['分摊金额'] = target_hours['工时'] / total_hours * orphan_amount
                                     
-                                    # 生成最终流数据
+                                    # 透视表
                                     track_proj = target_hours.groupby(['月份', '项目号'])['分摊金额'].sum().reset_index()
                                     track_proj.rename(columns={'分摊金额': '金额'}, inplace=True)
-                                    track_proj['科目名称'] = f"{track}-轧差"  # 统一为轧差列
+                                    track_proj['科目名称'] = f"{track}-轧差"
                                     final_stream.append(track_proj[['月份', '项目号', '科目名称', '金额']])
                                     
-                                    # 生成明细宽表行
+                                    # 明细
                                     variance_row = target_hours[['姓名', '工号', '月份', '项目号', '工时']].copy()
                                     for t in track_cols:
                                         variance_row[f'{t}-轧差'] = 0.0
                                     variance_row[f'{track}-轧差'] = target_hours['分摊金额']
                                     variance_detail_rows.append(variance_row)
                                     
-                                    # 记录明细
+                                    # 记录近亲归属明细
                                     relative_allocation_records.append({
                                         '姓名': person_name,
                                         '工号': person_id,
-                                        '孤儿月份': str(int(orphan_month_num)),
+                                        '孤儿月份': orphan_month_str,
                                         '归属月份': nearest_month,
                                         '赛道': track,
                                         '金额': orphan_amount,
-                                        '处理方式': f'漏斗轧差(归属至{nearest_month}月)'
+                                        '处理方式': f'近亲归属(至{nearest_month}月)'
                                     })
                                     
-                                    # logs.append(f"🔄 [{track}] {person_name} 的 {int(orphan_month_num)}月费用 → 归属至 {nearest_month}月")
+                                    logs.append(f"🔄 [{track}] {person_name} 的 {int(orphan_month_num)}月费用 {orphan_amount:,.2f} → 归属至 {nearest_month}月")
                                     has_relative = True
                         
+                        # 第二层：局部轧差（当月）
                         if not has_relative:
-                            global_orphan_records.append({
-                                '姓名': person_name, 
-                                '工号': person_id, 
-                                '月份': str(int(orphan_month_num)), 
-                                '赛道': track, 
-                                '金额': orphan_amount
-                            })
-                            # logs.append(f"⚠️ [{track}] {person_name} 的 {int(orphan_month_num)}月费用 无近亲，待全局轧差")
-
+                            month_time_agg = time_agg[time_agg['月份'] == orphan_month_str]
+                            
+                            if not month_time_agg.empty:
+                                total_month_hours = month_time_agg['工时'].sum()
+                                if total_month_hours > 0:
+                                    rate = orphan_amount / total_month_hours
+                                    
+                                    # 透视表
+                                    variance_alloc = month_time_agg[['月份', '项目号', '工时']].copy()
+                                    variance_alloc['金额'] = variance_alloc['工时'] * rate
+                                    variance_alloc['科目名称'] = f"{track}-轧差"
+                                    final_stream.append(variance_alloc[['月份', '项目号', '科目名称', '金额']])
+                                    
+                                    # 明细
+                                    variance_detail = month_time_agg[['姓名', '工号', '月份', '项目号', '工时']].copy()
+                                    for t in track_cols:
+                                        variance_detail[f'{t}-轧差'] = 0.0
+                                    variance_detail[f'{track}-轧差'] = variance_detail['工时'] * rate
+                                    variance_detail_rows.append(variance_detail)
+                                    
+                                    # 记录孤儿明细（局部轧差）- 新增
+                                    orphan_rows.append(pd.DataFrame([{
+                                        '姓名': person_name,
+                                        '工号': person_id,
+                                        '月份': orphan_month_str,
+                                        '赛道': track,
+                                        '金额': orphan_amount,
+                                        '处理方式': f'局部轧差({orphan_month_str}月)'
+                                    }]))
+                                    
+                                    logs.append(f"🏠 [{track}] {person_name} 的 {int(orphan_month_num)}月费用 {orphan_amount:,.2f} → 局部轧差（当月{len(month_time_agg)}人/{total_month_hours}小时）")
+                            else:
+                                # 第三层：全局轧差（当月也无工时）
+                                global_orphan_records.append({
+                                    '姓名': person_name, 
+                                    '工号': person_id, 
+                                    '月份': orphan_month_str, 
+                                    '赛道': track, 
+                                    '金额': orphan_amount
+                                })
+                                logs.append(f"⚠️ [{track}] {person_name} 的 {int(orphan_month_num)}月费用 {orphan_amount:,.2f} 无近亲且无当月工时，待全局轧差")
         # ==========================================
         # 关键：正常分摊（与孤儿处理同级，确保执行）
         # ==========================================
@@ -280,8 +358,6 @@ def run_allocation_v8(df_wage, df_time, df_expense, labor_subjects=[], enable_va
         # 全局孤儿轧差（在所有模式处理后执行，除了none模式）
         # ==========================================
         if global_orphan_records and enable_variance and orphan_mode != "none":
-            logs.append(f"🔍 开始全局轧差：{len(global_orphan_records)} 条记录")  # 调试日志
-            
             orphan_df_temp = pd.DataFrame(global_orphan_records)
             
             for track in track_cols:
@@ -290,11 +366,13 @@ def run_allocation_v8(df_wage, df_time, df_expense, labor_subjects=[], enable_va
                     continue
                 
                 orphan_sum = track_orphans['金额'].sum()
+                
+                # 记录孤儿明细（全局轧差）- 修改：确保记录到 orphan_rows
                 track_orphans_copy = track_orphans.copy()
                 track_orphans_copy['处理方式'] = '全局轧差'
                 orphan_rows.append(track_orphans_copy)
                 
-                logs.append(f"⚠️ [{track}] 全局孤儿费用: {orphan_sum:,.2f} 元")
+                logs.append(f"⚠️ [{track}] 全局孤儿费用: {orphan_sum:,.2f} 元（{len(track_orphans)} 条）")
                 
                 if global_total_hours > 0:
                     rate = orphan_sum / global_total_hours
@@ -313,7 +391,7 @@ def run_allocation_v8(df_wage, df_time, df_expense, labor_subjects=[], enable_va
                             variance_alloc_detail[f'{t}-轧差'] = 0.0
                     variance_detail_rows.append(variance_alloc_detail)
                     
-                    logs.append(f"⚖️ [{track}] 全局轧差完成")
+                    logs.append(f"⚖️ [{track}] 全局轧差完成: {orphan_sum:,.2f} 元")
                 else:
                     logs.append(f"🚫 [{track}] 无法全局轧差（总工时为0）")
 
@@ -442,12 +520,25 @@ def run_allocation_v8(df_wage, df_time, df_expense, labor_subjects=[], enable_va
 
     # 4.4 孤儿费用明细（代码保持不变）...
     orphan_df = pd.DataFrame()
+    
+    # 合并所有孤儿记录
+    all_orphan_records = []
+    
+    # 1. 近亲归属记录
     if relative_allocation_records:
         relative_df = pd.DataFrame(relative_allocation_records)
-        orphan_rows.append(relative_df)
+        all_orphan_records.append(relative_df)
     
+    # 2. 其他孤儿记录（局部轧差、全局轧差、未处理）
     if orphan_rows:
-        orphan_df = pd.concat(orphan_rows, ignore_index=True)
+        # orphan_rows 已经是 DataFrame 列表，需要合并
+        other_orphans = pd.concat(orphan_rows, ignore_index=True)
+        all_orphan_records.append(other_orphans)
+    
+    if all_orphan_records:
+        orphan_df = pd.concat(all_orphan_records, ignore_index=True)
+        # 去重并排序
+        orphan_df = orphan_df.drop_duplicates()
         if '金额' in orphan_df.columns:
             orphan_df = orphan_df.sort_values(['赛道', '处理方式', '金额'], ascending=[True, True, False])
 
